@@ -3,10 +3,9 @@
 #![allow(unused_imports)]
 
 use super::*;
-use rand;
 
-fn point2(x: f64, y: f64) -> super::Rect<2, f64> {
-    Rect::new_point([x, y])
+fn point2(x: f32, y: f32) -> Rect {
+    Rect::point(x, y)
 }
 
 use std::fmt::Display;
@@ -18,15 +17,15 @@ fn test_rtree(count: usize, points_only: bool) {
     let mut pts = vec![];
     for _ in 0..count {
         let xy = [
-            rand::random::<f64>() * 360.0 - 180.0,
-            rand::random::<f64>() * 180.0 - 90.0,
+            fastrand::f32() * 360.0 - 180.0,
+            fastrand::f32() * 180.0 - 90.0,
         ];
         if points_only {
-            pts.push(Rect::new_point(xy));
+            pts.push(Rect::point(xy[0], xy[0]));
         } else {
             pts.push(Rect::new(
                 xy,
-                [xy[0] + rand::random::<f64>(), xy[1] + rand::random::<f64>()],
+                [xy[0] + fastrand::f32(), xy[1] + fastrand::f32()],
             ));
         }
     }
@@ -39,7 +38,7 @@ fn test_rtree(count: usize, points_only: bool) {
         assert_eq!(tr.search(pts[i]).filter(|x| x.data == &i).count(), 1);
     }
     // scan all rects and compare
-    let mut all: Vec<IterItem<2, f64, usize>> = tr.scan().collect();
+    let mut all: Vec<IterItem<usize>> = tr.scan().collect();
     all.sort_by(|a, b| a.data.cmp(b.data));
     assert_eq!(all.len(), pts.len());
     for i in 0..pts.len() {
@@ -92,88 +91,19 @@ fn rects() {
     test_rtree(100_000, false);
 }
 
-impl<const D: usize, C, T: PartialEq> Node<D, C, T>
-where
-    C: PartialOrd + Copy + Sub<Output = C> + Mul<Output = C> + Display + Default,
-{
-    fn svg(&self, depth: usize) -> String {
-        let mut out = String::new();
-        if let Data::Nodes(nodes) = &self.data {
-            out += &format!(
-                "<rect x=\"{}\" y=\"{}\" width=\"{}\" \
-                       height=\"{}\" stroke=\"{}\" fill-opacity=\"0\" \
-                       stroke-opacity=\"1\" stroke-width=\"0.4\"/>\n",
-                self.rect.min[0],
-                self.rect.min[1],
-                self.rect.max[0] - self.rect.min[0],
-                self.rect.max[1] - self.rect.min[1],
-                ["red", "#009900", "#cccc00", "purple"][depth % 4]
-            );
-            for i in 0..nodes.len() {
-                out += &nodes[i].svg(depth + 1);
-            }
-        } else {
-            out += &format!(
-                "<circle cx=\"{}\" cy=\"{}\" r=\"0.2\" \
-                         fill=\"{}\" stroke-width=\"0\"/>\n",
-                self.rect.min[0], self.rect.min[1], "black"
-            );
-        }
-        return out;
-    }
-}
-
-impl<const D: usize, C, T: PartialEq> RTree<D, C, T>
-where
-    C: PartialOrd + Copy + Sub<Output = C> + Mul<Output = C> + Display + Default,
-{
-    pub fn svg(&self) -> String {
-        let mut out = String::new();
-        out += &format!(
-            "<svg viewBox=\"{} {} {} {}\" \
-                  xmlns =\"http://www.w3.org/2000/svg\">\n",
-            -190.0, -100.0, 380.0, 190.0,
-        );
-        out += "<g transform=\"scale(1,-1)\">\n";
-        if let Some(root) = &self.root {
-            out += &root.svg(0);
-        }
-        out += "</g>\n";
-        out += "</svg>\n";
-        out
-    }
-}
-
 #[test]
 fn default_rect() {
-    let mut tr: RTree<2, f64, usize> = RTree::new();
+    let mut tr: RTree<usize> = RTree::new();
     tr.insert(Rect::default(), 1);
 }
 
-#[test]
-fn svg() {
-    to_svg(PREDEF_PTS, "predefined.svg");
-    to_svg(CITIES_PTS, "cities.svg");
-}
-
-fn to_pts(pts: &str) -> Vec<[f64; 2]> {
+fn to_pts(pts: &str) -> Vec<[f32; 2]> {
     pts.split(";")
         .map(|x| {
-            let v: Vec<f64> = x.split(",").map(|x| x.parse().unwrap()).collect();
+            let v: Vec<f32> = x.split(",").map(|x| x.parse().unwrap()).collect();
             [v[0], v[1]]
         })
         .collect()
-}
-
-fn to_svg(pts: &str, path: &str) {
-    let pts = to_pts(pts);
-    let mut tr = RTree::new();
-    for i in 0..pts.len() {
-        tr.insert(point2(pts[i][0], pts[i][1]), i);
-    }
-    let svg = tr.svg();
-    let mut output = File::create(path).unwrap();
-    write!(output, "{}", svg).unwrap();
 }
 
 // These are hardcoded points that are for the purpose of filling an RTree
@@ -312,9 +242,9 @@ fn example() {
     let mut tr = RTree::new();
 
     // insert some points
-    tr.insert(Rect::new_point([-112.0078, 33.4373]), "PHX");
-    tr.insert(Rect::new_point([-118.4071, 33.9425]), "LAX");
-    tr.insert(Rect::new_point([-73.7822, 40.6441]), "JFK");
+    tr.insert(Rect::point([-112.0078, 33.4373]), "PHX");
+    tr.insert(Rect::point([-118.4071, 33.9425]), "LAX");
+    tr.insert(Rect::point([-73.7822, 40.6441]), "JFK");
 
     // Search a rectangle
     for item in tr.search(Rect::new([-112.1, 33.4], [-112.0, 33.5])) {
