@@ -22,7 +22,7 @@ fn benchmark(c: &mut Criterion) {
     static mut BLINK: Blink = Blink::new();
 
     unsafe {
-        let mut my_tr = rtree::RTree::new(&mut BLINK);
+        let mut my_tr = rtree::RTree::new(&BLINK);
         pts().for_each(|(i, p)| my_tr.insert(rtree::Rect::point(p[0], p[1]), i));
 
         let mut tr = rtree_rs::RTree::new();
@@ -87,13 +87,31 @@ fn benchmark(c: &mut Criterion) {
         );
     });
 
-    // c.bench_function("rstar insert", |b| {
-    //     b.iter_batched_ref(
-    //         || rstar::RTree::new(),
-    //         |tr| pts().for_each(|(_, p)| tr.insert(p)),
-    //         BatchSize::LargeInput,
-    //     );
-    // });
+    c.bench_function("rstar insert", |b| {
+        b.iter_batched_ref(
+            || rstar::RTree::new(),
+            |tr| pts().for_each(|(_, p)| tr.insert(p)),
+            BatchSize::LargeInput,
+        );
+    });
+    c.bench_function("rstar search-item", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut tr = rstar::RTree::new();
+                pts().for_each(|(_, p)| tr.insert(p));
+                tr
+            },
+            |tr| {
+                pts().for_each(|(_, p)| {
+                    let rect = rstar::AABB::from_corners(p, p);
+                    tr.locate_in_envelope_intersecting(&rect).for_each(|x| {
+                        black_box(x);
+                    });
+                })
+            },
+            BatchSize::LargeInput,
+        );
+    });
 }
 
 type P = [f32; 2];

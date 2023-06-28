@@ -24,7 +24,7 @@ pub struct Point {
 }
 
 impl Point {
-    fn new(x: f32, y: f32) -> Self {
+    const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
 
@@ -43,11 +43,16 @@ pub struct Rect {
 }
 
 impl Rect {
-    pub fn new(min: Point, max: Point) -> Self {
+    const INFINITY: Self = Self::new(
+        Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
+        Point::new(f32::INFINITY, f32::INFINITY),
+    );
+
+    pub const fn new(min: Point, max: Point) -> Self {
         Self { min, max }
     }
 
-    pub fn point(x: f32, y: f32) -> Self {
+    pub const fn point(x: f32, y: f32) -> Self {
         Self {
             min: Point { x, y },
             max: Point { x, y },
@@ -69,7 +74,7 @@ impl Rect {
         }
     }
 
-    fn largest_axis(&self) -> Axis {
+    fn larger_axis(&self) -> Axis {
         let x = self.max.x - self.min.x;
         let y = self.max.y - self.min.y;
         if y > x {
@@ -79,6 +84,7 @@ impl Rect {
         }
     }
 
+    /// Determines whether `rect` is intersecting `self`.
     fn intersects(&self, rect: &Self) -> bool {
         if rect.min.x > self.max.x || rect.max.x < self.min.x {
             return false;
@@ -89,6 +95,9 @@ impl Rect {
         true
     }
 
+    /// Determines whether `rect` is on the lower/upper/left/right edge of `self`.
+    ///
+    /// Assumes `rect` is intersecting.
     fn on_edge(&self, rect: &Self) -> bool {
         if !(rect.min.x > self.min.x) || !(rect.max.x < self.max.x) {
             return true;
@@ -118,58 +127,67 @@ impl Rect {
     }
 }
 
-trait Tx<T> {
-    type P: DerefMut<Target = T>;
-
-    fn a(self, value: T) -> Self::P;
+enum I {
+    P(List),
 }
 
-impl<'a, T: 'a> Tx<T> for &'a Blink {
-    type P = &'a mut T;
+struct N {
+    rect: Rect,
+    n: I,
+}
 
-    fn a(self, value: T) -> Self::P {
-        self.put_no_drop(value)
+fn choose_least_enlargement(nodes: &mut [N], rect: &Rect) -> &mut N {
+    let mut ret = None;
+    let mut min_delta = 0.0;
+    let mut min_area = 0.0;
+    for n in nodes {
+        let uarea = n.rect.unioned_area(rect);
+        let area = n.rect.area();
+        let delta = uarea - area;
+        if ret.is_none() || delta < min_delta || (delta == min_delta && area < min_area) {
+            ret = Some(n);
+            min_delta = delta;
+            min_area = area;
+        }
     }
+    ret.expect("empty parent")
 }
 
-trait Alloc<T> {
-    type Ptr<'a>: DerefMut<Target = T>
-    where
-        T: 'a,
-        Self: 'a;
+pub type NodeVec<T, A> = ArrayVec<Node<T, A>, MAX_ITEMS>;
 
-    fn alloc(&self, value: T) -> Self::Ptr<'_>;
+pub trait Alloc<T>: Sized {
+    type Output: DerefMut<Target = NodeVec<T, Self>>;
+
+    fn make(&self) -> Self::Output;
 }
 
 struct BoxAlloc;
 
 impl<T: 'static> Alloc<T> for BoxAlloc {
-    type Ptr<'a> = Box<T>;
+    type Output = Box<NodeVec<T, Self>>;
 
-    fn alloc(&self, value: T) -> Self::Ptr<'static> {
-        Box::new(value)
+    fn make(&self) -> Self::Output {
+        Box::new(NodeVec::new())
     }
 }
 
-impl<T> Alloc<T> for Blink {
-    type Ptr<'a> = &'a mut T where T: 'a;
+impl<'a, T: 'a> Alloc<T> for &'a Blink {
+    type Output = &'a mut NodeVec<T, Self>;
 
-    fn alloc(&self, value: T) -> Self::Ptr<'_> {
-        self.put_no_drop(value)
+    fn make(&self) -> Self::Output {
+        self.put_no_drop(NodeVec::new())
     }
 }
 
-type NodeVec<'n, T> = ArrayVec<Node<'n, T>, MAX_ITEMS>;
-
-struct Parent<'n, T: 'n> {
-    nodes: &'n mut NodeVec<'n, T>,
+pub struct Parent<T, A: Alloc<T>> {
+    nodes: A::Output,
     rect: Rect,
 }
 
-impl<'n, T: 'n> Parent<'n, T> {
-    fn new(rect: Rect, blink: &'n Blink) -> Self {
+impl<T, A: Alloc<T>> Parent<T, A> {
+    fn new(rect: Rect, alloc: &A) -> Self {
         Self {
-            nodes: blink.put_no_drop(ArrayVec::new()),
+            nodes: alloc.make(),
             rect,
         }
     }
@@ -182,7 +200,7 @@ impl<'n, T: 'n> Parent<'n, T> {
         self.nodes.is_full()
     }
 
-    fn choose_least_enlargement(&mut self, rect: &Rect) -> &mut Node<'n, T> {
+    fn choose_least_enlargement(&mut self, rect: &Rect) -> &mut Node<T, A> {
         let mut n = None;
         let mut min_delta = 0.0;
         let mut min_area = 0.0;
@@ -199,15 +217,15 @@ impl<'n, T: 'n> Parent<'n, T> {
         n.expect("empty parent")
     }
 
-    fn insert(&mut self, rect: Rect, item: T, height: usize, blink: &'n Blink) {
+    fn insert(&mut self, rect: Rect, item: T, height: usize, alloc: &A) {
         if height > 0 {
             // branch node
             let Node::Parent(child) = self.choose_least_enlargement(&rect) else {
                 return;
             };
-            child.insert(rect, item, height - 1, blink);
+            child.insert(rect, item, height - 1, alloc);
             if child.is_full() {
-                let right = child.split_largest_axis_edge_snap(blink);
+                let right = child.split_largest_axis_edge_snap(alloc);
                 self.nodes.push(right);
             }
         } else {
@@ -228,10 +246,10 @@ impl<'n, T: 'n> Parent<'n, T> {
         self.rect = rect;
     }
 
-    fn split_largest_axis_edge_snap(&mut self, blink: &'n Blink) -> Node<'n, T> {
+    fn split_largest_axis_edge_snap(&mut self, alloc: &A) -> Node<T, A> {
         let rect = self.rect;
-        let axis = rect.largest_axis();
-        let mut right = Parent::new(rect, blink);
+        let axis = rect.larger_axis();
+        let mut right = Parent::new(rect, alloc);
         let lchilds = &mut self.nodes;
         let rchilds = &mut right.nodes;
         let mut i = 0;
@@ -269,7 +287,7 @@ impl<'n, T: 'n> Parent<'n, T> {
         Node::Parent(right)
     }
 
-    fn push(&mut self, child: Node<'n, T>) {
+    fn push(&mut self, child: Node<T, A>) {
         self.nodes.push(child);
     }
 
@@ -314,7 +332,7 @@ impl<'n, T: 'n> Parent<'n, T> {
             }
         } else {
             for i in 0..nodes.len() {
-                let node = nodes[i].nodes_mut();
+                let node = nodes[i].nodes();
                 if !node.rect.intersects(rect) {
                     continue;
                 }
@@ -325,7 +343,7 @@ impl<'n, T: 'n> Parent<'n, T> {
                 let underflow = node.len() < MIN_ITEMS;
                 if underflow {
                     let nrect = node.rect;
-                    nodes.swap_remove(i).nodes_mut().flatten_into(reinsert);
+                    nodes.swap_remove(i).nodes().flatten_into(reinsert);
                     if !recalced {
                         recalced = self.rect.on_edge(&nrect);
                     }
@@ -338,17 +356,6 @@ impl<'n, T: 'n> Parent<'n, T> {
         }
         (None, false)
     }
-
-    pub fn search_flat<'this>(&'this self, rect: &Rect, items: &mut Vec<(Rect, &'this T)>) {
-        for node in self.nodes.iter() {
-            if node.rect().intersects(&rect) {
-                match node {
-                    Node::Item(item) => items.push((item.rect, &item.item)),
-                    Node::Parent(nodes) => nodes.search_flat(&rect, items),
-                }
-            }
-        }
-    }
 }
 
 pub struct Item<T> {
@@ -356,12 +363,12 @@ pub struct Item<T> {
     item: T,
 }
 
-enum Node<'n, T: 'n> {
+pub enum Node<T, A: Alloc<T>> {
     Item(Item<T>),
-    Parent(Parent<'n, T>),
+    Parent(Parent<T, A>),
 }
 
-impl<'n, T: 'n> Node<'n, T> {
+impl<T, A: Alloc<T>> Node<T, A> {
     fn rect(&self) -> &Rect {
         match self {
             Node::Item(n) => &n.rect,
@@ -376,21 +383,7 @@ impl<'n, T: 'n> Node<'n, T> {
         }
     }
 
-    fn into_item(self) -> T {
-        match self {
-            Node::Item(n) => n.item,
-            Node::Parent(_) => panic!("not a leaf node"),
-        }
-    }
-
-    fn nodes(&self) -> &Parent<'n, T> {
-        match self {
-            Node::Item(_) => panic!("not a parent node"),
-            Node::Parent(n) => n,
-        }
-    }
-
-    fn nodes_mut(&mut self) -> &mut Parent<'n, T> {
+    fn nodes(&mut self) -> &mut Parent<T, A> {
         match self {
             Node::Item(_) => panic!("not a parent node"),
             Node::Parent(n) => n,
@@ -398,20 +391,20 @@ impl<'n, T: 'n> Node<'n, T> {
     }
 }
 
-pub struct RTree<'n, T: 'n> {
-    blink: &'n Blink,
-    root: Option<Node<'n, T>>,
+pub struct RTree<T, A: Alloc<T>> {
+    root: Option<Node<T, A>>,
     length: usize,
     height: usize,
+    alloc: A,
 }
 
-impl<'n, T: 'n> RTree<'n, T> {
-    pub fn new(blink: &'n Blink) -> Self {
+impl<T, A: Alloc<T>> RTree<T, A> {
+    pub fn new(alloc: A) -> Self {
         RTree {
-            blink,
             root: None,
             length: 0,
             height: 0,
+            alloc,
         }
     }
 
@@ -426,12 +419,12 @@ impl<'n, T: 'n> RTree<'n, T> {
     pub fn insert(&mut self, rect: Rect, data: T) {
         let root = self
             .root
-            .get_or_insert_with(|| Node::Parent(Parent::new(rect, &self.blink)))
-            .nodes_mut();
-        root.insert(rect, data, self.height, &self.blink);
+            .get_or_insert_with(|| Node::Parent(Parent::new(rect, &self.alloc)))
+            .nodes();
+        root.insert(rect, data, self.height, &self.alloc);
         if root.is_full() {
-            let mut new_root = Parent::new(root.rect, &self.blink);
-            let right = root.split_largest_axis_edge_snap(&self.blink);
+            let mut new_root = Parent::new(root.rect, &self.alloc);
+            let right = root.split_largest_axis_edge_snap(&self.alloc);
             let left = self.root.take().unwrap();
             new_root.push(left);
             new_root.push(right);
@@ -446,7 +439,7 @@ impl<'n, T: 'n> RTree<'n, T> {
         T: PartialEq,
     {
         if let Some(root) = &mut self.root {
-            let root = root.nodes_mut();
+            let root = root.nodes();
             let mut reinsert = Vec::new();
             let (removed, recalced) = root.remove(&rect, data, &mut reinsert, self.height);
             if removed.is_none() {
@@ -457,12 +450,12 @@ impl<'n, T: 'n> RTree<'n, T> {
                 self.root = None;
             } else if self.height > 0 && root.len() == 1 {
                 let mut n = root.nodes.pop().unwrap();
-                n.nodes_mut().recalc();
+                n.nodes().recalc();
                 self.height -= 1;
                 self.root = Some(n);
             } else if recalced {
                 if let Some(root) = &mut self.root {
-                    root.nodes_mut().recalc();
+                    root.nodes().recalc();
                 }
             }
             while let Some(item) = reinsert.pop() {
@@ -474,23 +467,17 @@ impl<'n, T: 'n> RTree<'n, T> {
         }
     }
 
-    pub fn search_flat<'this>(&'this self, rect: Rect, items: &mut Vec<(Rect, &'this T)>) {
-        if let Some(root) = &self.root {
-            root.nodes().search_flat(&rect, items);
-        }
+    pub fn iter(&self) -> SearchIterator<'_, T, A> {
+        SearchIterator::new(&self.root, self.height, Rect::INFINITY)
     }
 
-    pub fn iter<'this>(&'this self) -> ScanIterator<'n, 'this, T> {
-        ScanIterator::new(self.root.as_ref().map(Node::nodes), self.height)
+    pub fn search(&self, rect: Rect) -> SearchIterator<'_, T, A> {
+        SearchIterator::new(&self.root, self.height, rect)
     }
 
-    pub fn search<'this>(&'this self, rect: Rect) -> SearchIterator<'n, 'this, T> {
-        SearchIterator::new(self.root.as_ref().map(Node::nodes), self.height, rect)
-    }
-
-    pub fn nearby<'this, F>(&'this self, dist: F) -> NearbyIterator<'n, 'this, T, F>
+    pub fn nearby<F>(&self, dist: F) -> NearbyIterator<T, A, F>
     where
-        F: FnMut(&Rect, Option<&'this T>) -> f32,
+        F: FnMut(&Rect, Option<&'_ T>) -> f32,
     {
         NearbyIterator::new(&self.root, dist)
     }
@@ -504,73 +491,31 @@ pub struct IterItem<'n, T> {
     pub dist: f32,
 }
 
-struct StackNode<'n, 'a, T> {
-    nodes: Iter<'a, Node<'n, T>>,
+struct StackNode<'a, T, A: Alloc<T>> {
+    nodes: Iter<'a, Node<T, A>>,
 }
 
-impl<'n, 'a, T> StackNode<'n, 'a, T> {
-    fn new_stack(root: Option<&'a Parent<'n, T>>, height: usize) -> Vec<StackNode<'n, 'a, T>> {
+impl<'a, T, A: Alloc<T>> StackNode<'a, T, A> {
+    fn new_stack(root: &'a Option<Node<T, A>>, height: usize) -> Vec<StackNode<'a, T, A>> {
         let mut stack = Vec::with_capacity(height + 1);
-        if let Some(root) = root {
+        if let Some(Node::Parent(parent)) = root {
             stack.push(StackNode {
-                nodes: root.nodes.iter(),
+                nodes: parent.nodes.iter(),
             });
         }
         stack
     }
 }
 
-// scan iterator
-
-pub struct ScanIterator<'n, 'a, T> {
-    stack: Vec<StackNode<'n, 'a, T>>,
-}
-
-impl<'n, 'a, T> ScanIterator<'n, 'a, T> {
-    fn new(root: Option<&'a Parent<'n, T>>, height: usize) -> Self {
-        Self {
-            stack: StackNode::new_stack(root, height),
-        }
-    }
-}
-
-impl<'n, 'a, T> Iterator for ScanIterator<'n, 'a, T> {
-    type Item = IterItem<'a, T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        'outer: while let Some(stack) = self.stack.last_mut() {
-            while let Some(node) = stack.nodes.next() {
-                match node {
-                    Node::Item(data) => {
-                        return Some(IterItem {
-                            rect: data.rect,
-                            data: &data.item,
-                            dist: Default::default(),
-                        });
-                    }
-                    Node::Parent(nodes) => {
-                        self.stack.push(StackNode {
-                            nodes: nodes.nodes.iter(),
-                        });
-                        continue 'outer;
-                    }
-                }
-            }
-            self.stack.pop();
-        }
-        None
-    }
-}
-
 // search iterator -- much like the scan iterator but with a intersects guard.
 
-pub struct SearchIterator<'n, 'a, T> {
-    stack: Vec<StackNode<'n, 'a, T>>,
+pub struct SearchIterator<'a, T, A: Alloc<T>> {
+    stack: Vec<StackNode<'a, T, A>>,
     rect: Rect,
 }
 
-impl<'n, 'a, T> SearchIterator<'n, 'a, T> {
-    fn new(root: Option<&'a Parent<'n, T>>, height: usize, rect: Rect) -> Self {
+impl<'a, T, A: Alloc<T>> SearchIterator<'a, T, A> {
+    fn new(root: &'a Option<Node<T, A>>, height: usize, rect: Rect) -> Self {
         Self {
             stack: StackNode::new_stack(root, height),
             rect,
@@ -578,7 +523,7 @@ impl<'n, 'a, T> SearchIterator<'n, 'a, T> {
     }
 }
 
-impl<'n, 'a, T> Iterator for SearchIterator<'n, 'a, T> {
+impl<'a, T, A: Alloc<T>> Iterator for SearchIterator<'a, T, A> {
     type Item = IterItem<'a, T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -609,41 +554,42 @@ impl<'n, 'a, T> Iterator for SearchIterator<'n, 'a, T> {
     }
 }
 
-struct NearbyItem<'n, 'a, T> {
+struct NearbyItem<'a, T, A: Alloc<T>> {
     dist: f32,
-    node: &'a Node<'n, T>,
+    node: &'a Node<T, A>,
 }
 
-impl<'n, 'a, T> PartialEq for NearbyItem<'n, 'a, T> {
+impl<'a, T, A: Alloc<T>> PartialEq for NearbyItem<'a, T, A> {
     fn eq(&self, other: &Self) -> bool {
         self.dist.eq(&other.dist)
     }
 }
 
-impl<'n, 'a, T> Eq for NearbyItem<'n, 'a, T> {}
+impl<'a, T, A: Alloc<T>> Eq for NearbyItem<'a, T, A> {}
 
-impl<'n, 'a, T> PartialOrd for NearbyItem<'n, 'a, T> {
+impl<'a, T, A: Alloc<T>> PartialOrd for NearbyItem<'a, T, A> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.dist.partial_cmp(&other.dist).map(Ordering::reverse)
     }
 }
 
-impl<'n, 'a, T> Ord for NearbyItem<'n, 'a, T> {
+impl<'a, T, A: Alloc<T>> Ord for NearbyItem<'a, T, A> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.dist.total_cmp(&other.dist)
     }
 }
 
-pub struct NearbyIterator<'n, 'a, T, F> {
-    queue: BinaryHeap<NearbyItem<'n, 'a, T>>,
+pub struct NearbyIterator<'a, T, A: Alloc<T>, F> {
+    queue: BinaryHeap<NearbyItem<'a, T, A>>,
     dist: F,
 }
 
-impl<'n, 'a, T, F> NearbyIterator<'n, 'a, T, F>
+impl<'a, T, A, F> NearbyIterator<'a, T, A, F>
 where
+    A: Alloc<T>,
     F: FnMut(&Rect, Option<&'a T>) -> f32,
 {
-    fn new(root: &'a Option<Node<'n, T>>, dist: F) -> Self {
+    fn new(root: &'a Option<Node<T, A>>, dist: F) -> Self {
         let mut queue = BinaryHeap::new();
         if let Some(root) = root {
             queue.push(NearbyItem {
@@ -655,8 +601,9 @@ where
     }
 }
 
-impl<'n, 'a, T, F> Iterator for NearbyIterator<'n, 'a, T, F>
+impl<'a, T, A, F> Iterator for NearbyIterator<'a, T, A, F>
 where
+    A: Alloc<T>,
     F: FnMut(&Rect, Option<&'a T>) -> f32,
 {
     type Item = IterItem<'a, T>;
