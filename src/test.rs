@@ -4,28 +4,23 @@
 
 use super::*;
 
-fn point2(x: f32, y: f32) -> Rect {
-    Rect::point(x, y)
-}
-
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{Error, Write};
 
 fn test_rtree(count: usize, points_only: bool) {
-    let mut tr = RTree::new();
+    let blink = Blink::new();
+    let mut tr = RTree::new(&blink);
     let mut pts = vec![];
     for _ in 0..count {
-        let xy = [
-            fastrand::f32() * 360.0 - 180.0,
-            fastrand::f32() * 180.0 - 90.0,
-        ];
+        let x = fastrand::f32() * 360.0 - 180.0;
+        let y = fastrand::f32() * 180.0 - 90.0;
         if points_only {
-            pts.push(Rect::point(xy[0], xy[0]));
+            pts.push(Rect::point(x, y));
         } else {
             pts.push(Rect::new(
-                xy,
-                [xy[0] + fastrand::f32(), xy[1] + fastrand::f32()],
+                Point::new(x, y),
+                Point::new(x + fastrand::f32(), y + fastrand::f32()),
             ));
         }
     }
@@ -38,7 +33,7 @@ fn test_rtree(count: usize, points_only: bool) {
         assert_eq!(tr.search(pts[i]).filter(|x| x.data == &i).count(), 1);
     }
     // scan all rects and compare
-    let mut all: Vec<IterItem<usize>> = tr.scan().collect();
+    let mut all: Vec<IterItem<usize>> = tr.iter().collect();
     all.sort_by(|a, b| a.data.cmp(b.data));
     assert_eq!(all.len(), pts.len());
     for i in 0..pts.len() {
@@ -55,7 +50,7 @@ fn test_rtree(count: usize, points_only: bool) {
     // scan kNN
     let mut dist = 0.0;
     let mut count = 0;
-    let target = Rect::new([-112.0, -33.0], [-112.0, -33.0]);
+    let target = Rect::new(Point::new(-112.0, -33.0), Point::new(-112.0, -33.0));
     for item in tr.nearby(|rect, _| rect.box_dist(&target)) {
         if item.dist < dist {
             panic!("out or order")
@@ -69,11 +64,11 @@ fn test_rtree(count: usize, points_only: bool) {
     for i in 0..pts.len() {
         let res = tr.remove(pts[i], &i).unwrap();
         // check the rect
-        if pts[i] != res.0 {
+        if pts[i] != res.rect {
             panic!("not equal");
         }
         // check the data
-        assert_eq!(res.1, i);
+        assert_eq!(res.item, i);
         // check the length
         assert_eq!(tr.len(), pts.len() - i - 1);
         // search for this item
@@ -93,7 +88,8 @@ fn rects() {
 
 #[test]
 fn default_rect() {
-    let mut tr: RTree<usize> = RTree::new();
+    let blink = Blink::new();
+    let mut tr = RTree::new(&blink);
     tr.insert(Rect::default(), 1);
 }
 
@@ -239,15 +235,19 @@ const CITIES_PTS: &str = "\
 
 #[test]
 fn example() {
-    let mut tr = RTree::new();
+    let blink = Blink::new();
+    let mut tr = RTree::new(&blink);
 
     // insert some points
-    tr.insert(Rect::point([-112.0078, 33.4373]), "PHX");
-    tr.insert(Rect::point([-118.4071, 33.9425]), "LAX");
-    tr.insert(Rect::point([-73.7822, 40.6441]), "JFK");
+    tr.insert(Rect::point(-112.0078, 33.4373), "PHX");
+    tr.insert(Rect::point(-118.4071, 33.9425), "LAX");
+    tr.insert(Rect::point(-73.7822, 40.6441), "JFK");
 
     // Search a rectangle
-    for item in tr.search(Rect::new([-112.1, 33.4], [-112.0, 33.5])) {
+    for item in tr.search(Rect::new(
+        Point::new(-112.1, 33.4),
+        Point::new(-112.0, 33.5),
+    )) {
         println!("{}", item.data);
     }
 

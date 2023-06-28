@@ -2,8 +2,10 @@
 mod test;
 
 use arrayvec::ArrayVec;
+use blink_alloc::Blink;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ops::DerefMut;
 use std::slice::Iter;
 
 const MAX_ITEMS: usize = 32;
@@ -22,6 +24,10 @@ pub struct Point {
 }
 
 impl Point {
+    fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+
     fn on(self, axis: Axis) -> f32 {
         match axis {
             Axis::X => self.x,
@@ -112,66 +118,101 @@ impl Rect {
     }
 }
 
-type NodeVec<T> = ArrayVec<Node<T>, MAX_ITEMS>;
+trait Tx<T> {
+    type P: DerefMut<Target = T>;
 
-#[derive(Clone)]
-struct Nodes<T> {
-    nodes: Box<NodeVec<T>>,
+    fn a(self, value: T) -> Self::P;
 }
 
-impl<T> Nodes<T> {
-    fn new(rect: Rect) -> Self {
-        Self {
-            rect,
-            nodes: Box::new(NodeVec::new()),
-        }
-    }
+impl<'a, T: 'a> Tx<T> for &'a Blink {
+    type P = &'a mut T;
 
-    fn is_full(&self) -> bool {
-        self.nodes.is_full()
+    fn a(self, value: T) -> Self::P {
+        self.put_no_drop(value)
+    }
+}
+
+trait Alloc<T> {
+    type Ptr<'a>: DerefMut<Target = T>
+    where
+        T: 'a,
+        Self: 'a;
+
+    fn alloc(&self, value: T) -> Self::Ptr<'_>;
+}
+
+struct BoxAlloc;
+
+impl<T: 'static> Alloc<T> for BoxAlloc {
+    type Ptr<'a> = Box<T>;
+
+    fn alloc(&self, value: T) -> Self::Ptr<'static> {
+        Box::new(value)
+    }
+}
+
+impl<T> Alloc<T> for Blink {
+    type Ptr<'a> = &'a mut T where T: 'a;
+
+    fn alloc(&self, value: T) -> Self::Ptr<'_> {
+        self.put_no_drop(value)
+    }
+}
+
+type NodeVec<'n, T> = ArrayVec<Node<'n, T>, MAX_ITEMS>;
+
+struct Parent<'n, T: 'n> {
+    nodes: &'n mut NodeVec<'n, T>,
+    rect: Rect,
+}
+
+impl<'n, T: 'n> Parent<'n, T> {
+    fn new(rect: Rect, blink: &'n Blink) -> Self {
+        Self {
+            nodes: blink.put_no_drop(ArrayVec::new()),
+            rect,
+        }
     }
 
     fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    fn choose_least_enlargement(&mut self, rect: &Rect) -> Option<&mut Nodes<T>> {
-        let mut res = None;
-        let mut min_enlargement = rect.min.x;
-        let mut min_area = rect.min.x;
+    fn is_full(&self) -> bool {
+        self.nodes.is_full()
+    }
+
+    fn choose_least_enlargement(&mut self, rect: &Rect) -> &mut Node<'n, T> {
+        let mut n = None;
+        let mut min_delta = 0.0;
+        let mut min_area = 0.0;
         for node in self.nodes.iter_mut() {
-            let uarea = node.rect.unioned_area(rect);
-            let area = node.rect.area();
-            let enlargement = uarea - area;
-            if res.is_none()
-                || enlargement < min_enlargement
-                || (enlargement == min_enlargement && area < min_area)
-            {
-                res = Some(node);
-                min_enlargement = enlargement;
+            let uarea = node.rect().unioned_area(rect);
+            let area = node.rect().area();
+            let delta = uarea - area;
+            if n.is_none() || delta < min_delta || (delta == min_delta && area < min_area) {
+                n = Some(node);
+                min_delta = delta;
                 min_area = area;
             }
         }
-        res
+        n.expect("empty parent")
     }
 
-    fn insert(&mut self, rect: Rect, item: T, height: usize) {
-        if height == 0 {
-            // leaf node
-            self.nodes.push(Node::item(rect, item));
-        } else {
+    fn insert(&mut self, rect: Rect, item: T, height: usize, blink: &'n Blink) {
+        if height > 0 {
             // branch node
-            if let Some(Node {
-                data: Data::Nodes(child),
-                ..
-            }) = self.choose_least_enlargement(&rect)
-            {
-                child.insert(rect, item, height - 1);
-                if child.is_full() {
-                    let right = child.split_largest_axis_edge_snap();
-                    self.nodes.push(right);
-                }
+            let Node::Parent(child) = self.choose_least_enlargement(&rect) else {
+                return;
+            };
+            child.insert(rect, item, height - 1, blink);
+            if child.is_full() {
+                let right = child.split_largest_axis_edge_snap(blink);
+                self.nodes.push(right);
             }
+        } else {
+            // leaf node
+            self.nodes.push(Node::Item(Item { rect, item }));
         }
         self.rect.expand(&rect);
     }
@@ -180,23 +221,23 @@ impl<T> Nodes<T> {
         if self.nodes.len() == 0 {
             return;
         }
-        let mut rect = self.nodes[0].rect.clone();
+        let mut rect = self.nodes[0].rect().clone();
         for i in 1..self.nodes.len() {
-            rect.expand(&self.nodes[i].rect);
+            rect.expand(&self.nodes[i].rect());
         }
         self.rect = rect;
     }
 
-    fn split_largest_axis_edge_snap(&mut self) -> Node<T> {
+    fn split_largest_axis_edge_snap(&mut self, blink: &'n Blink) -> Node<'n, T> {
         let rect = self.rect;
         let axis = rect.largest_axis();
-        let mut right = Nodes::new(rect);
+        let mut right = Parent::new(rect, blink);
         let lchilds = &mut self.nodes;
         let rchilds = &mut right.nodes;
         let mut i = 0;
         while i < lchilds.len() {
-            let min = lchilds[i].rect.min.on(axis) - rect.min.on(axis);
-            let max = rect.max.on(axis) - lchilds[i].rect.max.on(axis);
+            let min = lchilds[i].rect().min.on(axis) - rect.min.on(axis);
+            let max = rect.max.on(axis) - lchilds[i].rect().max.on(axis);
             if min < max {
                 // stay left
                 i += 1;
@@ -209,13 +250,13 @@ impl<T> Nodes<T> {
         // MIN_ITEMS by moving items into under-flowed nodes.
         if lchilds.len() < MIN_ITEMS {
             // reverse sort by min axis
-            rchilds.sort_unstable_by_key(|n| Ordered(n.rect.min.on(axis)));
+            rchilds.sort_unstable_by_key(|n| Ordered(n.rect().min.on(axis)));
             while lchilds.len() < MIN_ITEMS {
                 lchilds.push(rchilds.pop().unwrap());
             }
         } else if rchilds.len() < MIN_ITEMS {
             // reverse sort by max axis
-            lchilds.sort_unstable_by_key(|n| Ordered(n.rect.max.on(axis)));
+            lchilds.sort_unstable_by_key(|n| Ordered(n.rect().max.on(axis)));
             while rchilds.len() < MIN_ITEMS {
                 rchilds.push(lchilds.pop().unwrap());
             }
@@ -225,23 +266,22 @@ impl<T> Nodes<T> {
         right.recalc();
         self.sort_by_x();
         right.sort_by_x();
-        Node::Nodes(right)
+        Node::Parent(right)
     }
 
-    fn push(&mut self, child: Node<T>) {
+    fn push(&mut self, child: Node<'n, T>) {
         self.nodes.push(child);
     }
 
     fn sort_by_x(&mut self) {
-        self.nodes.sort_unstable_by_key(|n| Ordered(n.rect.min.x));
+        self.nodes.sort_unstable_by_key(|n| Ordered(n.rect().min.x));
     }
 
-    fn flatten_into(&mut self, reinsert: &mut Vec<(Rect, T)>) {
-        let nodes = &mut self.nodes;
-        while let Some(node) = nodes.pop() {
+    fn flatten_into(&mut self, reinsert: &mut Vec<Item<T>>) {
+        while let Some(node) = self.nodes.pop() {
             match node {
-                Node::Item(item) => reinsert.push((item.rect, item.item)),
-                Node::Nodes(mut nodes) => nodes.flatten_into(reinsert),
+                Node::Item(item) => reinsert.push(item),
+                Node::Parent(mut nodes) => nodes.flatten_into(reinsert),
             }
         }
     }
@@ -250,9 +290,9 @@ impl<T> Nodes<T> {
         &mut self,
         rect: &Rect,
         data: &T,
-        reinsert: &mut Vec<(Rect, T)>,
+        reinsert: &mut Vec<Item<T>>,
         height: usize,
-    ) -> (Option<(Rect, T)>, bool)
+    ) -> (Option<Item<T>>, bool)
     where
         T: PartialEq,
     {
@@ -260,14 +300,17 @@ impl<T> Nodes<T> {
         if height == 0 {
             // remove from leaf
             for i in 0..nodes.len() {
-                if nodes[i].item() == data {
-                    let out = nodes.swap_remove(i);
-                    let recalced = self.rect.on_edge(&out.rect);
-                    if recalced {
-                        self.recalc();
-                    }
-                    return (Some((out.rect.clone(), out.into_item())), recalced);
+                if nodes[i].item() != data {
+                    continue;
                 }
+                let Node::Item(item) = nodes.swap_remove(i) else {
+                    continue;
+                };
+                let recalced = self.rect.on_edge(&item.rect);
+                if recalced {
+                    self.recalc();
+                }
+                return (Some(item), recalced);
             }
         } else {
             for i in 0..nodes.len() {
@@ -296,49 +339,76 @@ impl<T> Nodes<T> {
         (None, false)
     }
 
-    pub fn search_flat<'a>(&'a self, rect: &Rect, items: &mut Vec<(Rect, &'a T)>) {
+    pub fn search_flat<'this>(&'this self, rect: &Rect, items: &mut Vec<(Rect, &'this T)>) {
         for node in self.nodes.iter() {
-            if node.rect.intersects(&rect) {
+            if node.rect().intersects(&rect) {
                 match node {
                     Node::Item(item) => items.push((item.rect, &item.item)),
-                    Node::Nodes(nodes) => nodes.search_flat(&rect, items),
+                    Node::Parent(nodes) => nodes.search_flat(&rect, items),
                 }
             }
         }
     }
 }
 
-#[derive(Clone)]
-enum Data<T> {
-    Item(T),
-    Nodes(Nodes<T>),
-}
-
-#[derive(Clone)]
-struct Node<T> {
+pub struct Item<T> {
     rect: Rect,
-    data: Data<T>,
+    item: T,
 }
 
-impl<T> Node<T> {
-    fn item(rect: Rect, item: T) -> Self {
-        Self {
-            rect,
-            data: Data::Item(item),
+enum Node<'n, T: 'n> {
+    Item(Item<T>),
+    Parent(Parent<'n, T>),
+}
+
+impl<'n, T: 'n> Node<'n, T> {
+    fn rect(&self) -> &Rect {
+        match self {
+            Node::Item(n) => &n.rect,
+            Node::Parent(n) => &n.rect,
+        }
+    }
+
+    fn item(&self) -> &T {
+        match self {
+            Node::Item(n) => &n.item,
+            Node::Parent(_) => panic!("not a leaf node"),
+        }
+    }
+
+    fn into_item(self) -> T {
+        match self {
+            Node::Item(n) => n.item,
+            Node::Parent(_) => panic!("not a leaf node"),
+        }
+    }
+
+    fn nodes(&self) -> &Parent<'n, T> {
+        match self {
+            Node::Item(_) => panic!("not a parent node"),
+            Node::Parent(n) => n,
+        }
+    }
+
+    fn nodes_mut(&mut self) -> &mut Parent<'n, T> {
+        match self {
+            Node::Item(_) => panic!("not a parent node"),
+            Node::Parent(n) => n,
         }
     }
 }
 
-#[derive(Clone)]
-pub struct RTree<T> {
-    root: Option<Node<T>>,
+pub struct RTree<'n, T: 'n> {
+    blink: &'n Blink,
+    root: Option<Node<'n, T>>,
     length: usize,
     height: usize,
 }
 
-impl<T: PartialEq> RTree<T> {
-    pub fn new() -> Self {
+impl<'n, T: 'n> RTree<'n, T> {
+    pub fn new(blink: &'n Blink) -> Self {
         RTree {
+            blink,
             root: None,
             length: 0,
             height: 0,
@@ -350,28 +420,31 @@ impl<T: PartialEq> RTree<T> {
     }
 
     pub fn rect(&self) -> Option<Rect> {
-        self.root.as_ref().map(|root| root.rect.clone())
+        self.root.as_ref().map(|root| root.rect().clone())
     }
 
     pub fn insert(&mut self, rect: Rect, data: T) {
         let root = self
             .root
-            .get_or_insert_with(|| Node::Nodes(Nodes::new(rect)))
+            .get_or_insert_with(|| Node::Parent(Parent::new(rect, &self.blink)))
             .nodes_mut();
-        root.insert(rect, data, self.height);
+        root.insert(rect, data, self.height, &self.blink);
         if root.is_full() {
-            let mut new_root = Nodes::new(root.rect);
-            let right = root.split_largest_axis_edge_snap();
+            let mut new_root = Parent::new(root.rect, &self.blink);
+            let right = root.split_largest_axis_edge_snap(&self.blink);
             let left = self.root.take().unwrap();
             new_root.push(left);
             new_root.push(right);
-            self.root = Some(Node::Nodes(new_root));
+            self.root = Some(Node::Parent(new_root));
             self.height += 1;
         }
         self.length += 1;
     }
 
-    pub fn remove(&mut self, rect: Rect, data: &T) -> Option<(Rect, T)> {
+    pub fn remove(&mut self, rect: Rect, data: &T) -> Option<Item<T>>
+    where
+        T: PartialEq,
+    {
         if let Some(root) = &mut self.root {
             let root = root.nodes_mut();
             let mut reinsert = Vec::new();
@@ -393,7 +466,7 @@ impl<T: PartialEq> RTree<T> {
                 }
             }
             while let Some(item) = reinsert.pop() {
-                self.insert(item.0, item.1);
+                self.insert(item.rect, item.item);
             }
             removed
         } else {
@@ -401,27 +474,23 @@ impl<T: PartialEq> RTree<T> {
         }
     }
 
-    pub fn search_flat<'a>(&'a self, rect: Rect, items: &mut Vec<(Rect, &'a T)>) {
+    pub fn search_flat<'this>(&'this self, rect: Rect, items: &mut Vec<(Rect, &'this T)>) {
         if let Some(root) = &self.root {
             root.nodes().search_flat(&rect, items);
         }
     }
 
-    pub fn iter(&self) -> ScanIterator<T> {
-        self.scan()
-    }
-
-    pub fn scan(&self) -> ScanIterator<T> {
+    pub fn iter<'this>(&'this self) -> ScanIterator<'n, 'this, T> {
         ScanIterator::new(self.root.as_ref().map(Node::nodes), self.height)
     }
 
-    pub fn search(&self, rect: Rect) -> SearchIterator<T> {
+    pub fn search<'this>(&'this self, rect: Rect) -> SearchIterator<'n, 'this, T> {
         SearchIterator::new(self.root.as_ref().map(Node::nodes), self.height, rect)
     }
 
-    pub fn nearby<F>(&self, dist: F) -> NearbyIterator<T, F>
+    pub fn nearby<'this, F>(&'this self, dist: F) -> NearbyIterator<'n, 'this, T, F>
     where
-        F: FnMut(&Rect, Option<&'_ T>) -> f32,
+        F: FnMut(&Rect, Option<&'this T>) -> f32,
     {
         NearbyIterator::new(&self.root, dist)
     }
@@ -429,18 +498,18 @@ impl<T: PartialEq> RTree<T> {
 
 // iterators, ScanIterator, SearchIterator, NearbyIterator
 
-pub struct IterItem<'a, T> {
+pub struct IterItem<'n, T> {
     pub rect: Rect,
-    pub data: &'a T,
+    pub data: &'n T,
     pub dist: f32,
 }
 
-struct StackNode<'a, T> {
-    nodes: Iter<'a, Node<T>>,
+struct StackNode<'n, 'a, T> {
+    nodes: Iter<'a, Node<'n, T>>,
 }
 
-impl<'a, T> StackNode<'a, T> {
-    fn new_stack(root: Option<&'a Nodes<T>>, height: usize) -> Vec<StackNode<'a, T>> {
+impl<'n, 'a, T> StackNode<'n, 'a, T> {
+    fn new_stack(root: Option<&'a Parent<'n, T>>, height: usize) -> Vec<StackNode<'n, 'a, T>> {
         let mut stack = Vec::with_capacity(height + 1);
         if let Some(root) = root {
             stack.push(StackNode {
@@ -453,19 +522,19 @@ impl<'a, T> StackNode<'a, T> {
 
 // scan iterator
 
-pub struct ScanIterator<'a, T> {
-    stack: Vec<StackNode<'a, T>>,
+pub struct ScanIterator<'n, 'a, T> {
+    stack: Vec<StackNode<'n, 'a, T>>,
 }
 
-impl<'a, T> ScanIterator<'a, T> {
-    fn new(root: Option<&'a Nodes<T>>, height: usize) -> Self {
+impl<'n, 'a, T> ScanIterator<'n, 'a, T> {
+    fn new(root: Option<&'a Parent<'n, T>>, height: usize) -> Self {
         Self {
             stack: StackNode::new_stack(root, height),
         }
     }
 }
 
-impl<'a, T> Iterator for ScanIterator<'a, T> {
+impl<'n, 'a, T> Iterator for ScanIterator<'n, 'a, T> {
     type Item = IterItem<'a, T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -479,7 +548,7 @@ impl<'a, T> Iterator for ScanIterator<'a, T> {
                             dist: Default::default(),
                         });
                     }
-                    Node::Nodes(nodes) => {
+                    Node::Parent(nodes) => {
                         self.stack.push(StackNode {
                             nodes: nodes.nodes.iter(),
                         });
@@ -495,13 +564,13 @@ impl<'a, T> Iterator for ScanIterator<'a, T> {
 
 // search iterator -- much like the scan iterator but with a intersects guard.
 
-pub struct SearchIterator<'a, T> {
-    stack: Vec<StackNode<'a, T>>,
+pub struct SearchIterator<'n, 'a, T> {
+    stack: Vec<StackNode<'n, 'a, T>>,
     rect: Rect,
 }
 
-impl<'a, T> SearchIterator<'a, T> {
-    fn new(root: Option<&'a Nodes<T>>, height: usize, rect: Rect) -> Self {
+impl<'n, 'a, T> SearchIterator<'n, 'a, T> {
+    fn new(root: Option<&'a Parent<'n, T>>, height: usize, rect: Rect) -> Self {
         Self {
             stack: StackNode::new_stack(root, height),
             rect,
@@ -509,13 +578,13 @@ impl<'a, T> SearchIterator<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for SearchIterator<'a, T> {
+impl<'n, 'a, T> Iterator for SearchIterator<'n, 'a, T> {
     type Item = IterItem<'a, T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         'outer: while let Some(stack) = self.stack.last_mut() {
             while let Some(node) = stack.nodes.next() {
-                if !node.rect.intersects(&self.rect) {
+                if !node.rect().intersects(&self.rect) {
                     continue;
                 }
                 match node {
@@ -526,7 +595,7 @@ impl<'a, T> Iterator for SearchIterator<'a, T> {
                             dist: Default::default(),
                         });
                     }
-                    Node::Nodes(nodes) => {
+                    Node::Parent(nodes) => {
                         self.stack.push(StackNode {
                             nodes: nodes.nodes.iter(),
                         });
@@ -540,41 +609,41 @@ impl<'a, T> Iterator for SearchIterator<'a, T> {
     }
 }
 
-struct NearbyItem<'a, T> {
+struct NearbyItem<'n, 'a, T> {
     dist: f32,
-    node: &'a Node<T>,
+    node: &'a Node<'n, T>,
 }
 
-impl<'a, T> PartialEq for NearbyItem<'a, T> {
+impl<'n, 'a, T> PartialEq for NearbyItem<'n, 'a, T> {
     fn eq(&self, other: &Self) -> bool {
         self.dist.eq(&other.dist)
     }
 }
 
-impl<'a, T> Eq for NearbyItem<'a, T> {}
+impl<'n, 'a, T> Eq for NearbyItem<'n, 'a, T> {}
 
-impl<'a, T> PartialOrd for NearbyItem<'a, T> {
+impl<'n, 'a, T> PartialOrd for NearbyItem<'n, 'a, T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.dist.partial_cmp(&other.dist).map(Ordering::reverse)
     }
 }
 
-impl<'a, T> Ord for NearbyItem<'a, T> {
+impl<'n, 'a, T> Ord for NearbyItem<'n, 'a, T> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.dist.total_cmp(&other.dist)
     }
 }
 
-pub struct NearbyIterator<'a, T, F> {
-    queue: BinaryHeap<NearbyItem<'a, T>>,
+pub struct NearbyIterator<'n, 'a, T, F> {
+    queue: BinaryHeap<NearbyItem<'n, 'a, T>>,
     dist: F,
 }
 
-impl<'a, T, F> NearbyIterator<'a, T, F>
+impl<'n, 'a, T, F> NearbyIterator<'n, 'a, T, F>
 where
     F: FnMut(&Rect, Option<&'a T>) -> f32,
 {
-    fn new(root: &'a Option<Node<T>>, dist: F) -> Self {
+    fn new(root: &'a Option<Node<'n, T>>, dist: F) -> Self {
         let mut queue = BinaryHeap::new();
         if let Some(root) = root {
             queue.push(NearbyItem {
@@ -586,7 +655,7 @@ where
     }
 }
 
-impl<'a, T, F> Iterator for NearbyIterator<'a, T, F>
+impl<'n, 'a, T, F> Iterator for NearbyIterator<'n, 'a, T, F>
 where
     F: FnMut(&Rect, Option<&'a T>) -> f32,
 {
@@ -602,11 +671,11 @@ where
                         dist: item.dist,
                     });
                 }
-                Node::Nodes(nodes) => {
+                Node::Parent(nodes) => {
                     self.queue.extend(nodes.nodes.iter().map(|node| {
                         let (rect, item) = match node {
                             Node::Item(item) => (&item.rect, Some(&item.item)),
-                            Node::Nodes(nodes) => (&nodes.rect, None),
+                            Node::Parent(nodes) => (&nodes.rect, None),
                         };
                         let dist = (self.dist)(rect, item);
                         NearbyItem { dist, node }

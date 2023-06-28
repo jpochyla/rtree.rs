@@ -1,3 +1,4 @@
+use blink_alloc::Blink;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use std::hint::black_box;
 use std::time::Duration;
@@ -6,6 +7,7 @@ criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(200)
+        .warm_up_time(Duration::from_secs(10))
         .measurement_time(Duration::from_secs(10));
     targets = benchmark
 }
@@ -17,23 +19,27 @@ fn benchmark(c: &mut Criterion) {
     let data = data();
     let pts = || data.pts.iter().copied().enumerate();
 
-    let mut my_tr = rtree::RTree::new();
-    pts().for_each(|(i, p)| my_tr.insert(rtree::Rect::point(p[0], p[1]), i));
+    static mut BLINK: Blink = Blink::new();
 
-    let mut tr = rtree_rs::RTree::new();
-    pts().for_each(|(i, p)| tr.insert(rtree_rs::Rect::new_point(p), i));
+    unsafe {
+        let mut my_tr = rtree::RTree::new(&mut BLINK);
+        pts().for_each(|(i, p)| my_tr.insert(rtree::Rect::point(p[0], p[1]), i));
 
-    my_tr.scan().zip(tr.scan()).for_each(|(x, y)| {
-        assert_eq!(*x.data, *y.data);
+        let mut tr = rtree_rs::RTree::new();
+        pts().for_each(|(i, p)| tr.insert(rtree_rs::Rect::new_point(p), i));
+
+        my_tr.iter().zip(tr.scan()).for_each(|(x, y)| {
+            assert_eq!(*x.data, *y.data);
+        });
+    }
+
+    c.bench_function("rtree_rs insert", |b| {
+        b.iter_batched_ref(
+            || rtree_rs::RTree::new(),
+            |tr| pts().for_each(|(i, p)| tr.insert(rtree_rs::Rect::new_point(p), i)),
+            BatchSize::LargeInput,
+        );
     });
-
-    // c.bench_function("rtree_rs insert", |b| {
-    //     b.iter_batched_ref(
-    //         || rtree_rs::RTree::new(),
-    //         |tr| pts().for_each(|(i, p)| tr.insert(rtree_rs::Rect::new_point(p), i)),
-    //         BatchSize::LargeInput,
-    //     );
-    // });
     c.bench_function("rtree_rs search-item", |b| {
         b.iter_batched_ref(
             || {
@@ -48,20 +54,25 @@ fn benchmark(c: &mut Criterion) {
                     });
                 })
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
-    // c.bench_function("rtree insert", |b| {
-    //     b.iter_batched_ref(
-    //         || rtree::RTree::new(),
-    //         |tr| pts().for_each(|(i, p)| tr.insert(rtree::Rect::point(p), i)),
-    //         BatchSize::LargeInput,
-    //     );
-    // });
+
+    c.bench_function("rtree insert", |b| {
+        b.iter_batched_ref(
+            || unsafe {
+                BLINK.reset();
+                rtree::RTree::new(&BLINK)
+            },
+            |tr| pts().for_each(|(i, [x, y])| tr.insert(rtree::Rect::point(x, y), i)),
+            BatchSize::LargeInput,
+        );
+    });
     c.bench_function("rtree search-item", |b| {
         b.iter_batched_ref(
-            || {
-                let mut tr = rtree::RTree::new();
+            || unsafe {
+                BLINK.reset();
+                let mut tr = rtree::RTree::new(&BLINK);
                 pts().for_each(|(i, [x, y])| tr.insert(rtree::Rect::point(x, y), i));
                 tr
             },
@@ -72,7 +83,7 @@ fn benchmark(c: &mut Criterion) {
                     });
                 })
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
